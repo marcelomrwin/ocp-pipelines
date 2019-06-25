@@ -1,0 +1,108 @@
+kind: BuildConfig
+apiVersion: v1
+metadata:
+  annotations:
+    pipeline.alpha.openshift.io/uses: '[{"name": "jenkins", "namespace": "", "kind": "DeploymentConfig"}]'
+  labels:
+    app: dotnet-app-pipeline
+    name: dotnet-app-pipeline
+  name: dotnet-app-pipeline
+spec:
+  strategy:
+    type: JenkinsPipeline
+    jenkinsPipelineStrategy:
+      jenkinsfile: |-
+        node("dotnet-21") {
+          // random version number.
+          def version = new Random().nextInt(1000)
+          stage('clone sources') {
+            echo "Starting Pipeline for version ${version}"
+            sh "git clone <<GIT_CLONE_URL>> --branch master ."
+          }
+          stage('Code Analysis'){
+            sh "dotnet sonarscanner begin /k:'dotnet-app' /v:$version /d:sonar.host.url='http://sonarqube:9000' /d:sonar.login=admin /d:sonar.password=admin"
+            sh "dotnet build"
+            sh "dotnet sonarscanner end /d:sonar.login=admin /d:sonar.password=admin"
+          }
+          stage('Build release version') {
+              echo "Building version ${version}"
+              sh "dotnet publish ConsultaCCC.Api -c Release -f netcoreapp2.1"
+          }
+          stage('create image') {
+              def newTag = "TestingCandidate-${version}"
+              echo "New Tag: ${newTag}"
+              sh 'oc new-build --name=dotnet-app dotnet-runtime:2.1 --binary=true -n dotnet-app-dev || true'
+              sh 'oc start-build dotnet-app --from-dir=<<MAIN_APP_DIR>>/bin/Release/netcoreapp2.1/publish --follow -n dotnet-app-dev'
+              openshiftTag alias: 'false', destStream: 'dotnet-app', destTag: newTag, destinationNamespace: 'dotnet-app-dev', namespace: 'dotnet-app-dev', srcStream: 'dotnet-app', srcTag: 'latest', verbose: 'false'
+          }
+          stage('Deploy to Dev') {
+            sh "oc new-app dotnet-app-dev/dotnet-app:TestingCandidate-$version --name=dotnet-app --allow-missing-imagestream-tags=true -n dotnet-app-dev || echo 'app já existe'"
+            sh "oc patch dc dotnet-app --patch '{\"spec\": { \"triggers\": [ { \"type\": \"ImageChange\", \"imageChangeParams\": { \"containerNames\": [ \"dotnet-app\" ], \"from\": { \"kind\": \"ImageStreamTag\", \"namespace\": \"dotnet-app-dev\", \"name\": \"dotnet-app:TestingCandidate-$version\"}}}]}}' -n dotnet-app-dev"
+            sh "oc set triggers dc/dotnet-app --remove-all -n dotnet-app-dev"
+            sh "oc expose dc dotnet-app --port 8080 -n dotnet-app-dev || echo 'svc já existe'"
+            sh "oc expose svc dotnet-app -n dotnet-app-dev || echo 'route já existe'"
+            openshiftDeploy depCfg: 'dotnet-app', namespace: 'dotnet-app-dev', verbose: 'false', waitTime: '180', waitUnit: 'sec'
+            openshiftVerifyDeployment depCfg: 'dotnet-app', namespace: 'dotnet-app-dev', replicaCount: '1', verbose: 'false', verifyReplicaCount: 'false', waitTime: '180', waitUnit: 'sec'
+            openshiftVerifyService namespace: 'dotnet-app-dev', svcName: 'dotnet-app', verbose: 'false'
+          }
+          stage('Integration Test') {
+            def newTag = "ProdReady-${version}"
+            echo "New Tag: ${newTag}"
+            timeout(5) {
+                  waitUntil {
+                      def r = sh (
+                          script: 'curl -i -s <<URL_HEALTH_CHECK>> | head -n 1 |cut -d$\' \' -f2',
+                          returnStdout: true
+                      ).trim()
+                      return r.toInteger().equals(200);
+                  }
+            }
+            openshiftTag alias: 'false', destStream: 'dotnet-app', destTag: newTag, destinationNamespace: 'dotnet-app-dev', namespace: 'dotnet-app-dev', srcStream: 'dotnet-app', srcTag: 'latest', verbose: 'false'
+          }
+          stage('Approve version to production'){
+            timeout(time: 15, unit: 'MINUTES') {
+              input "Promote this build to production?"
+            }
+          }
+          def dest   = "dotnet-app-green"
+          def active = ""
+          stage('Preparation for Prod Deploy') {
+            sh "oc new-app dotnet-app-dev/dotnet-app:ProdReady-1.0 --name=dotnet-app-green --allow-missing-imagestream-tags=true -n dotnet-app-prod || echo 'app já existe'"
+            sh "oc new-app dotnet-app-dev/dotnet-app:ProdReady-1.0 --name=dotnet-app-blue --allow-missing-imagestream-tags=true -n dotnet-app-prod || echo 'app já existe'"
+            sh "oc set resources dc/dotnet-app-green --limits=cpu='1000m',memory='750Mi' --requests=cpu='250m',memory='200Mi' -n dotnet-app-prod || echo 'Limit e CPUs já definidos!'"
+            sh "oc set resources dc/dotnet-app-blue --limits=cpu='1000m',memory='750Mi' --requests=cpu='250m',memory='200Mi' -n dotnet-app-prod || echo 'Limit e CPUs já definidos!'"
+            sh "oc set probe dc dotnet-app-green --readiness --initial-delay-seconds=1 --timeout-seconds=10 --get-url=http://:8080/<<PATH_HEALTH_CHECK>> -n dotnet-app-prod || echo 'Readiness check já existe para o sistema!'"
+            sh "oc set probe dc dotnet-app-blue --readiness --initial-delay-seconds=1 --timeout-seconds=10 --get-url=http://:8080/<<PATH_HEALTH_CHECK>> -n dotnet-app-prod || echo 'Readiness check já existe para o sistema!'"
+            sh "oc set probe dc dotnet-app-green --liveness --initial-delay-seconds=120 --timeout-seconds=10 --get-url=http://:8080/<<PATH_HEALTH_CHECK>> -n dotnet-app-prod || echo 'Liveness check já existe para o sistema!'"
+            sh "oc set probe dc dotnet-app-blue --liveness --initial-delay-seconds=120 --timeout-seconds=10 --get-url=http://:8080/<<PATH_HEALTH_CHECK>> -n dotnet-app-prod || echo 'Liveness check já existe para o sistema!'"
+            sh "oc autoscale dc dotnet-app-blue --cpu-percent=90 --min=1 --max=5 -n dotnet-app-prod || echo 'Autoscaler já existe!'"
+            sh "oc autoscale dc dotnet-app-green --cpu-percent=90 --min=1 --max=5 -n dotnet-app-prod || echo 'Autoscaler já existe!'"
+            sh "oc set triggers dc/dotnet-app-green --remove-all -n dotnet-app-prod"
+            sh "oc set triggers dc/dotnet-app-blue --remove-all -n dotnet-app-prod"
+            sh "oc expose dc dotnet-app-blue --port 8080 -n dotnet-app-prod || echo 'svc já existe'"
+            sh "oc expose dc dotnet-app-green --port 8080 -n dotnet-app-prod || echo 'svc já existe'"
+            sh "oc expose svc/dotnet-app-green --name dotnet-app -n dotnet-app-prod || echo 'route já existe'"
+            sh "oc get route dotnet-app -n dotnet-app-prod -o jsonpath='{ .spec.to.name }' > activesvc.txt"
+            active = readFile('activesvc.txt').trim()
+            if (active == "dotnet-app-green") {
+              dest = "dotnet-app-blue"
+            }
+            echo "Active svc: " + active
+            echo "Dest svc:   " + dest
+          }
+          stage('Deploy to Prod') {
+            echo "Deploying to ${dest}"
+            sh "oc patch dc ${dest} --patch '{\"spec\": { \"triggers\": [ { \"type\": \"ImageChange\", \"imageChangeParams\": { \"containerNames\": [ \"$dest\" ], \"from\": { \"kind\": \"ImageStreamTag\", \"namespace\": \"dotnet-app-dev\", \"name\": \"dotnet-app:ProdReady-$version\"}}}]}}' -n dotnet-app-prod"
+            sh "oc expose service ${dest} -n dotnet-app-prod || echo 'Rota já existe'"
+            openshiftDeploy depCfg: dest, namespace: 'dotnet-app-prod', verbose: 'false', waitTime: '180', waitUnit: 'sec'
+            openshiftVerifyDeployment depCfg: dest, namespace: 'dotnet-app-prod', replicaCount: '1', verbose: 'false', verifyReplicaCount: 'true', waitTime: '180', waitUnit: 'sec'
+            openshiftVerifyService namespace: 'dotnet-app-prod', svcName: dest, verbose: 'false'
+          }
+          stage('Switch over to new Version') {
+            sh 'oc patch route dotnet-app -n dotnet-app-prod -p \'{"spec":{"to":{"name":"' + dest + '"}}}\''
+            sh 'oc get route dotnet-app -n dotnet-app-prod > oc_out.txt'
+            oc_out = readFile('oc_out.txt')
+            echo "Current route configuration: " + oc_out
+          }
+        }
+    type: JenkinsPipeline
